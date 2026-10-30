@@ -207,7 +207,8 @@ def test_swiglu_lowprec_matches_pytorch(grad_dtype, shape):
     gate_ref = gate0.clone().requires_grad_(True)
     up_ref = up0.clone().requires_grad_(True)
     ref = torch.nn.functional.silu(gate_ref) * up_ref
-    ref.backward(grad.float())
+    # the output is fp16, so autograd hands our backward the gradient rounded to fp16
+    ref.backward(grad.half().float())
 
     gate = gate0.clone().requires_grad_(True)
     up = up0.clone().requires_grad_(True)
