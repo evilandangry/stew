@@ -23,6 +23,13 @@ def apply():
     from ._extra_patches import apply_extra
     apply_extra()
 
+    try:  # fused rotary embedding (our own Triton kernel); guarded, falls back to the original
+        from .rope import patch_qwen2_rope
+        patch_qwen2_rope()
+        print("[solution] OK: patch_qwen2_rope")
+    except Exception as e:  # noqa: BLE001
+        print(f"[solution] SKIPPED patch_qwen2_rope: {e}")
+
     try:  # keep the tied embedding / LM head once in fp16 (memory); guarded, falls back silently
         from .embed_fp16 import patch_embed_fp16
         patch_embed_fp16()
