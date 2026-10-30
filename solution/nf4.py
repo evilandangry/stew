@@ -1,15 +1,22 @@
 """NF4 de-quantisation kernel in Triton (written from scratch).
 
-bitsandbytes unpacks a 4-bit NF4 weight to a dense fp16 matrix before every matmul
-(forward and backward, ~5% of a training step on this task).  This file does the same
-unpacking with our own kernel: each byte holds two 4-bit codes (high nibble first),
-every 64-element block has one fp32 scale ("absmax"; with double quantisation the
-scales are first restored by bitsandbytes' own small routine), value = code[idx] * absmax.
+bitsandbytes unpacks a 4-bit NF4 weight to a dense fp16 matrix before every matmul, in the
+forward and again in the backward pass (~8% of the GPU time of a training step here). This file
+does that unpacking with our own kernel, for both directions.
 
-Idea source: the NF4 format of QLoRA (Dettmers et al., 2023) and bitsandbytes' public
-documentation of its layout.  The kernel itself is our own code.
-Anything unusual (other quant type, transposed weight, out= given, ...) falls back to
-the original bitsandbytes function.
+Format: each byte holds two 4-bit codes (high nibble first); every block of `blocksize` values
+(64 here) has one scale ("absmax"). With double quantisation the scales are themselves stored as
+8-bit codes: scale = code2[absmax8[block]] * absmax2[block // 256] + offset.
+value = nf4_code[nibble] * scale, computed in fp32 and rounded once, exactly like bitsandbytes.
+
+Layout of the kernel: one program handles NBLK whole quantisation blocks as a 2-D tile
+[NBLK, blocksize/2 bytes]. The scale is decoded once per block (row), not once per byte, and the
+two nibbles of each byte are interleaved in registers (tl.join + reshape) so every row is written
+with one contiguous store instead of two strided ones.
+
+Idea source: the NF4 format of QLoRA (Dettmers et al., 2023) and bitsandbytes' layout of it.
+The kernel is our own code. Anything unusual (other quant type, shapes not a multiple of the
+block, out= given, ...) falls back to the original bitsandbytes path.
 """
 import torch
 import triton
@@ -17,38 +24,32 @@ import triton.language as tl
 
 _CODE = {}
 _BROKEN = False
+_NBLK = 32  # quantisation blocks per program: 32 x 64 values = 2048 outputs
 
 
 @triton.jit
-def _nf4_deq(A, ABS, CODE, OUT, n_bytes, blocksize, BLOCK: tl.constexpr):
+def _nf4_unpack(A, ABS, ABS8, CODE2, ABS2, OFF, CODE, OUT, n_blocks, bs2,
+                NESTED: tl.constexpr, HB: tl.constexpr, NBLK: tl.constexpr):
     pid = tl.program_id(0)
-    idx = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    m = idx < n_bytes
-    b = tl.load(A + idx, mask=m, other=0).to(tl.int32)
-    hi = b >> 4
-    lo = b & 15
-    scale = tl.load(ABS + (idx * 2) // blocksize, mask=m, other=0.0)
-    c_hi = tl.load(CODE + hi)
-    c_lo = tl.load(CODE + lo)
-    tl.store(OUT + idx * 2, (c_hi * scale).to(OUT.dtype.element_ty), mask=m)
-    tl.store(OUT + idx * 2 + 1, (c_lo * scale).to(OUT.dtype.element_ty), mask=m)
+    rows = (pid * NBLK + tl.arange(0, NBLK)).to(tl.int64)  # quantisation blocks of this tile
+    rmask = rows < n_blocks
+    if NESTED:
+        q = tl.load(ABS8 + rows, mask=rmask, other=0).to(tl.int32)
+        outer = tl.load(ABS2 + rows // bs2, mask=rmask, other=0.0)
+        scale = tl.load(CODE2 + q) * outer + tl.load(OFF)
+    else:
+        scale = tl.load(ABS + rows, mask=rmask, other=0.0)
 
-@triton.jit
-def _nf4_deq2(A, ABS8, CODE2, ABS2, OFF, CODE, OUT, n_bytes, blocksize, bs2,
-              BLOCK: tl.constexpr):
-    pid = tl.program_id(0)
-    idx = pid.to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    m = idx < n_bytes
-    b = tl.load(A + idx, mask=m, other=0).to(tl.int32)
-    blk = (idx * 2) // blocksize
-    q = tl.load(ABS8 + blk, mask=m, other=0).to(tl.int32)
-    s2 = tl.load(ABS2 + blk // bs2, mask=m, other=0.0)
-    scale = tl.load(CODE2 + q) * s2 + tl.load(OFF)
-    c_hi = tl.load(CODE + (b >> 4))
-    c_lo = tl.load(CODE + (b & 15))
-    tl.store(OUT + idx * 2, (c_hi * scale).to(OUT.dtype.element_ty), mask=m)
-    tl.store(OUT + idx * 2 + 1, (c_lo * scale).to(OUT.dtype.element_ty), mask=m)
-                  
+    cols = tl.arange(0, HB)
+    b = tl.load(A + rows[:, None] * HB + cols[None, :], mask=rmask[:, None], other=0).to(tl.int32)
+    hi = tl.load(CODE + (b >> 4)) * scale[:, None]   # first value of each pair
+    lo = tl.load(CODE + (b & 15)) * scale[:, None]   # second value
+    vals = tl.reshape(tl.join(hi, lo), (NBLK, 2 * HB))  # hi0, lo0, hi1, lo1, ...
+    ocols = tl.arange(0, 2 * HB)
+    tl.store(OUT + rows[:, None] * (2 * HB) + ocols[None, :],
+             vals.to(OUT.dtype.element_ty), mask=rmask[:, None])
+
+
 def _code(device):
     key = str(device)
     if key not in _CODE:
@@ -57,22 +58,37 @@ def _code(device):
     return _CODE[key]
 
 
+def _supported(A, st):
+    """True when our kernel can unpack packed weight A with quant state st."""
+    return (st is not None and A.is_cuda and A.dtype == torch.uint8
+            and getattr(st, "quant_type", None) == "nf4"
+            and st.dtype in (torch.float16, torch.float32)
+            and st.blocksize in (32, 64, 128, 256)
+            and len(st.shape) == 2
+            and st.shape.numel() == 2 * A.numel()
+            and st.shape.numel() % st.blocksize == 0
+            and (not st.nested or st.state2.blocksize == 256))
+
+
 def dequantize_nf4(A, st):
+    """Unpacked weight of shape st.shape and dtype st.dtype (callers check _supported first)."""
     flat = A.reshape(-1)
     out = torch.empty(st.shape, dtype=st.dtype, device=A.device)
-    n_bytes = flat.numel()
-    block = 1024
-    grid = (triton.cdiv(n_bytes, block),)
+    n_blocks = st.shape.numel() // st.blocksize
+    grid = (triton.cdiv(n_blocks, _NBLK),)
+    code = _code(A.device)
     if st.nested:
         s2 = st.state2
+        absmax8 = st.absmax.contiguous()
         offset = torch.as_tensor(st.offset, dtype=torch.float32, device=A.device).reshape(1)
-        _nf4_deq2[grid](flat, st.absmax.contiguous(), s2.code.float().contiguous(),
-                        s2.absmax.float().contiguous(), offset, _code(A.device), out,
-                        n_bytes, st.blocksize, s2.blocksize, BLOCK=block, num_warps=4)
+        _nf4_unpack[grid](flat, absmax8, absmax8, s2.code.float().contiguous(),
+                          s2.absmax.float().contiguous(), offset, code, out, n_blocks,
+                          s2.blocksize, NESTED=True, HB=st.blocksize // 2, NBLK=_NBLK,
+                          num_warps=4)
     else:
         absmax = st.absmax.float().contiguous()
-        _nf4_deq[grid](flat, absmax, _code(A.device), out, n_bytes,
-                       st.blocksize, BLOCK=block, num_warps=4)
+        _nf4_unpack[grid](flat, absmax, absmax, absmax, absmax, absmax, code, out, n_blocks,
+                          1, NESTED=False, HB=st.blocksize // 2, NBLK=_NBLK, num_warps=4)
     return out
 
 
@@ -86,14 +102,9 @@ def patch_bnb_dequant():
     def dequantize_4bit(A, quant_state=None, absmax=None, out=None, blocksize=64,
                         quant_type="fp4"):
         global _BROKEN
-        st = quant_state
-        if (not _BROKEN and st is not None and absmax is None and out is None
-                and A.is_cuda and A.dtype == torch.uint8 and A.shape[0] != 1
-                and getattr(st, "quant_type", None) == "nf4"
-                and st.dtype in (torch.float16, torch.float32)
-                and st.blocksize % 2 == 0 and st.shape.numel() == 2 * A.numel()):
+        if (not _BROKEN and absmax is None and out is None and _supported(A, quant_state)):
             try:
-                return dequantize_nf4(A, st)
+                return dequantize_nf4(A, quant_state)
             except Exception:  # never break training because of the speed-up
                 _BROKEN = True
         return orig(A, quant_state, absmax, out, blocksize, quant_type)
@@ -128,12 +139,8 @@ def _patch_matmul4bit_forward():
 
     def forward(ctx, A, B, out=None, bias=None, quant_state=None):
         st = quant_state
-        if (not _BROKEN and out is None and st is not None and A.is_cuda
-                and A.numel() > A.shape[-1] and B.dtype == torch.uint8
-                and getattr(st, "quant_type", None) == "nf4"
-                and st.dtype in (torch.float16, torch.float32) and st.blocksize % 2 == 0
-                and len(st.shape) == 2 and st.shape.numel() == 2 * B.numel()
-                and (not st.nested or st.state2.blocksize == 256)):
+        if (not _BROKEN and out is None and A.is_cuda and A.numel() > A.shape[-1]
+                and _supported(B, st)):
             Bv = B.view(-1, 1)  # the same canonical layout bitsandbytes uses
             try:
                 weight = dequantize_nf4(Bv, st).to(A.dtype)
