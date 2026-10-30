@@ -23,5 +23,12 @@ def apply():
     from ._extra_patches import apply_extra
     apply_extra()
 
+    try:  # keep the tied embedding / LM head once in fp16 (memory); guarded, falls back silently
+        from .embed_fp16 import patch_embed_fp16
+        patch_embed_fp16()
+        print("[solution] OK: patch_embed_fp16")
+    except Exception as e:  # noqa: BLE001
+        print(f"[solution] SKIPPED patch_embed_fp16: {e}")
+
     from . import debug_saved  # DEBUG ONLY: does nothing unless the flag file exists
     debug_saved.patch()
