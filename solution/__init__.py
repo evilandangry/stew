@@ -30,6 +30,13 @@ def apply():
     except Exception as e:  # noqa: BLE001
         print(f"[solution] SKIPPED patch_qwen2_rope: {e}")
 
+    try:  # skip the padding inside a batch (per-token work on real tokens only); guarded
+        from .unpad import patch_unpad
+        patch_unpad()
+        print("[solution] OK: patch_unpad")
+    except Exception as e:  # noqa: BLE001
+        print(f"[solution] SKIPPED patch_unpad: {e}")
+
     try:  # keep the tied embedding / LM head once in fp16 (memory); guarded, falls back silently
         from .embed_fp16 import patch_embed_fp16
         patch_embed_fp16()
