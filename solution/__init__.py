@@ -22,3 +22,6 @@ def apply():
 
     from ._extra_patches import apply_extra
     apply_extra()
+
+    from . import debug_saved  # DEBUG ONLY: does nothing unless the flag file exists
+    debug_saved.patch()
