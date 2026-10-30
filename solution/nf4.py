@@ -104,3 +104,50 @@ def patch_bnb_dequant():
     for name, mod in list(sys.modules.items()):
         if name.startswith("bitsandbytes") and getattr(mod, "dequantize_4bit", None) is orig:
             mod.dequantize_4bit = dequantize_4bit
+    _patch_matmul4bit_forward()
+
+
+def _patch_matmul4bit_forward():
+    """Send the FORWARD matmul of 4-bit layers through our unpack too.
+
+    bitsandbytes 0.50 runs the forward of a 4-bit layer through its own fused op
+    (torch.ops.bitsandbytes.gemm_4bit: unpack + matmul), which never calls dequantize_4bit, so
+    the patch above only reached the backward. The profile showed bitsandbytes' own unpack
+    kernel (kDequantizeBlockwise) still running once per layer per step next to ours.
+    Here MatMul4Bit.forward does the same two steps with our kernel: unpack, then a normal fp16
+    matmul with the bias. It saves the same state as the original, so bitsandbytes' backward
+    runs unchanged. Anything unusual (out= given, empty input, other quant types) keeps the
+    original path.
+    """
+    from bitsandbytes.autograd import _functions as BFN
+
+    cls = BFN.MatMul4Bit
+    orig = cls.forward
+    if getattr(orig, "_soup_fused", False):
+        return
+
+    def forward(ctx, A, B, out=None, bias=None, quant_state=None):
+        st = quant_state
+        if (not _BROKEN and out is None and st is not None and A.is_cuda
+                and A.numel() > A.shape[-1] and B.dtype == torch.uint8
+                and getattr(st, "quant_type", None) == "nf4"
+                and st.dtype in (torch.float16, torch.float32) and st.blocksize % 2 == 0
+                and len(st.shape) == 2 and st.shape.numel() == 2 * B.numel()
+                and (not st.nested or st.state2.blocksize == 256)):
+            Bv = B.view(-1, 1)  # the same canonical layout bitsandbytes uses
+            try:
+                weight = dequantize_nf4(Bv, st).to(A.dtype)
+            except Exception:  # never break training because of the speed-up
+                weight = None
+            if weight is not None:
+                output = torch.nn.functional.linear(A, weight, bias)
+                ctx.is_empty = False
+                ctx.state = st
+                ctx.dtype_A, ctx.dtype_B = A.dtype, Bv.dtype
+                ctx.dtype_bias = None if bias is None else bias.dtype
+                ctx.tensors = (None, Bv) if any(ctx.needs_input_grad[:2]) else (None, None)
+                return output
+        return orig(ctx, A, B, out, bias, quant_state)
+
+    forward._soup_fused = True
+    cls.forward = staticmethod(forward)
