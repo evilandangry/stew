@@ -26,3 +26,6 @@ def apply():
     patch_qwen2_rope()  # our own fused rotary embedding
     patch_causal_lm_loss()  # our own fused cross-entropy (memory)
     patch_bnb_dequant()  # our own one-pass NF4 unpack
+    from .debug_dtypes import install  # DEBUG ONLY, remove before submission
+
+    install()
