@@ -191,3 +191,31 @@ def test_nf4_dequant_matches_bitsandbytes(nested, shape):
     mismatch = (out != ref).float().mean().item()
     assert mismatch < 1e-4, f"{mismatch:.2e} of the values differ from bitsandbytes"
     torch.testing.assert_close(out.float(), ref.float(), rtol=2e-3, atol=2e-3)
+
+
+@pytest.mark.parametrize("grad_dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("shape", [(4, 512, 8960), (3, 77, 1001)])
+def test_swiglu_lowprec_matches_pytorch(grad_dtype, shape):
+    from solution.swiglu_lp import swiglu_lowprec
+
+    torch.manual_seed(0)
+    # the real inputs are fp16 matmul results widened to fp32, so build them the same way
+    gate0 = torch.randn(shape, device="cuda", dtype=torch.float16).float()
+    up0 = torch.randn(shape, device="cuda", dtype=torch.float16).float()
+    grad = torch.randn(shape, device="cuda", dtype=grad_dtype)
+
+    gate_ref = gate0.clone().requires_grad_(True)
+    up_ref = up0.clone().requires_grad_(True)
+    ref = torch.nn.functional.silu(gate_ref) * up_ref
+    ref.backward(grad.float())
+
+    gate = gate0.clone().requires_grad_(True)
+    up = up0.clone().requires_grad_(True)
+    out = swiglu_lowprec(gate, up)
+    out.backward(grad)
+
+    assert out.dtype == torch.float16
+    assert gate.grad.dtype == torch.float32 and up.grad.dtype == torch.float32
+    torch.testing.assert_close(out.float(), ref.detach(), rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(gate.grad, gate_ref.grad, rtol=2e-4, atol=2e-4)
+    torch.testing.assert_close(up.grad, up_ref.grad, rtol=2e-4, atol=2e-4)
