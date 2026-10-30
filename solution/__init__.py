@@ -13,6 +13,8 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
+from .dequant4 import patch_bnb_dequant
+from .loss import patch_causal_lm_loss
 from .rmsnorm import patch_qwen2_rmsnorm
 from .rope import patch_qwen2_rope
 from .swiglu import patch_qwen2_mlp
@@ -22,3 +24,5 @@ def apply():
     patch_qwen2_mlp()  # the example: works out of the box, does not count as our own kernel
     patch_qwen2_rmsnorm()  # our own fused RMSNorm
     patch_qwen2_rope()  # our own fused rotary embedding
+    patch_causal_lm_loss()  # our own fused cross-entropy (memory)
+    patch_bnb_dequant()  # our own one-pass NF4 unpack

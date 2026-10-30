@@ -127,3 +127,67 @@ def test_rope_matches_pytorch(x_dtype, c_dtype, heads, cos_batch):
     tol = 1e-4 if x_dtype == torch.float32 else 1e-2
     torch.testing.assert_close(out.float(), ref.float(), rtol=tol, atol=tol)
     torch.testing.assert_close(x_new.grad.float(), x_ref.grad.float(), rtol=tol, atol=tol)
+
+
+def _ce_reference(logits, labels, num_items=None):
+    """transformers' ForCausalLMLoss, plus the entropy and per-token loss we also produce."""
+    vocab = logits.shape[-1]
+    x = logits.detach().float().requires_grad_(True)
+    shifted = torch.nn.functional.pad(labels, (0, 1), value=-100)[..., 1:].contiguous()
+    flat = x.view(-1, vocab)
+    tgt = shifted.view(-1)
+    if num_items is None:
+        loss = torch.nn.functional.cross_entropy(flat, tgt, ignore_index=-100)
+    else:
+        loss = torch.nn.functional.cross_entropy(flat, tgt, ignore_index=-100, reduction="sum")
+        loss = loss / num_items
+    lse = torch.logsumexp(flat.detach(), dim=-1)
+    p = torch.softmax(flat.detach(), dim=-1)
+    entropy = (lse - (p * flat.detach()).sum(-1)).view(shifted.shape)
+    tok = torch.nn.functional.cross_entropy(flat.detach(), tgt, ignore_index=-100,
+                                            reduction="none").view(shifted.shape)
+    return x, loss, entropy, tok
+
+
+@pytest.mark.parametrize("shape", [(3, 77, 1001), (2, 64, 151936)])
+@pytest.mark.parametrize("num_items", [None, 150])
+def test_fused_cross_entropy_matches_pytorch(shape, num_items):
+    from solution.loss import fused_for_causal_lm_loss
+
+    torch.manual_seed(0)
+    batch, seq, vocab = shape
+    logits0 = (torch.randn(shape, device="cuda", dtype=torch.float16) * 3)
+    labels = torch.randint(0, vocab, (batch, seq), device="cuda")
+    labels[:, : seq // 3] = -100  # an unsupervised prefix, as in SFT
+    labels[0, -5:] = -100
+
+    x_ref, loss_ref, ent_ref, tok_ref = _ce_reference(logits0, labels, num_items)
+    loss_ref.backward()
+
+    logits = logits0.clone().requires_grad_(True)
+    n = None if num_items is None else torch.tensor(num_items, device="cuda")
+    loss = fused_for_causal_lm_loss(logits, labels, vocab, n)
+    loss.backward()
+
+    torch.testing.assert_close(loss.float(), loss_ref.float(), rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(logits.grad.float(), x_ref.grad.float(), rtol=3e-3, atol=2e-6)
+    torch.testing.assert_close(logits._fused_ce_entropy, ent_ref, rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(logits._fused_ce_token_loss, tok_ref, rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("nested", [True, False])
+@pytest.mark.parametrize("shape", [(512, 256), (1536, 8960)])
+def test_nf4_dequant_matches_bitsandbytes(nested, shape):
+    import bitsandbytes.functional as bnb_f
+    from solution.dequant4 import _ORIGINAL_DEQUANTIZE_4BIT, dequantize_nf4
+
+    torch.manual_seed(0)
+    weight = torch.randn(shape, device="cuda", dtype=torch.float16) * 0.05
+    packed, state = bnb_f.quantize_4bit(weight, blocksize=64, compress_statistics=nested,
+                                        quant_type="nf4")
+    ref = _ORIGINAL_DEQUANTIZE_4BIT(packed, state)
+    out = dequantize_nf4(packed, state)
+    assert out.shape == ref.shape and out.dtype == ref.dtype
+    mismatch = (out != ref).float().mean().item()
+    assert mismatch < 1e-4, f"{mismatch:.2e} of the values differ from bitsandbytes"
+    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-3, atol=2e-3)
