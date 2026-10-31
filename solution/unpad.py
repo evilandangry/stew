@@ -36,8 +36,17 @@ _STATE = threading.local()
 _SAID = set()
 _ORIG_MODEL_FORWARD = None
 _MAX_N = [0]
+_CALLS = [0]
 
-MLP_TOKEN_BUDGET = 1000  # tokens' worth of full MLP activations kept per layer at the peak
+
+def _mark(label):
+    try:
+        from .timeline import mark
+        mark(label)
+    except Exception:  # noqa: BLE001
+        pass
+
+MLP_TOKEN_BUDGET = 700  # tokens' worth of full MLP activations kept per layer at the peak
 _MLP_SAVED_SHARE = 0.63  # share of a layer's saved activations that recomputing gate/up removes
 
 
@@ -305,6 +314,9 @@ def patch_unpad():
             print(f"[solution] unpad: active (first batch: {n} real tokens of {B * T} slots, "
                   f"{'per-row attention' if lens else 'padded attention'})")
         kwargs.pop("return_dict", None)
+        _CALLS[0] += 1
+        if _CALLS[0] in (1, 3, 64):
+            _mark(f"training forward {_CALLS[0]} starts")
         layers = self.config.num_hidden_layers
         recompute = _mlp_recompute_layers(n, layers)
         if n > _MAX_N[0]:
@@ -355,7 +367,9 @@ def patch_unpad():
     setup = SFTTrainerWrapper._setup_transformers
     if not getattr(setup, "_soup_unpad", False):
         def _setup_transformers(self, *args, **kw):
+            _mark("Soup starts building the model")
             out = setup(self, *args, **kw)
+            _mark("model built (4-bit weights, LoRA)")
             try:
                 count = wrap_lora_dropouts(getattr(self, "model", None))
                 print(f"[solution] unpad: {count} LoRA dropout modules draw their masks on the padded shape")

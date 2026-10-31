@@ -17,6 +17,11 @@ from .swiglu import patch_qwen2_mlp
 
 
 def apply():
+    try:
+        from .timeline import install
+        install()
+    except Exception:  # noqa: BLE001
+        pass
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kerne
 
 
