@@ -50,3 +50,30 @@ def test_rope_matches_pytorch(x_dtype, c_dtype, heads, cos_batch):
     tol = 1e-4 if x_dtype == torch.float32 else 1e-2
     torch.testing.assert_close(out.float(), ref.float(), rtol=tol, atol=tol)
     torch.testing.assert_close(x_new.grad.float(), x_ref.grad.float(), rtol=tol, atol=tol)
+
+
+@pytest.mark.parametrize("heads", [12, 2])
+def test_rope_fp16_output_matches_autocast_rounding(heads):
+    """With out_dtype=fp16 the kernel returns what autocast would hand to the attention: the fp32
+    rotation rounded once to fp16. The backward then takes and returns fp16."""
+    from solution.rope import rope
+
+    torch.manual_seed(0)
+    batch, seq, dim = 4, 77, 128
+    base = torch.randn(batch, seq, heads, dim, device="cuda", dtype=torch.float16) * 2
+    x0 = base.transpose(1, 2)
+    cos = torch.randn(1, seq, dim, device="cuda", dtype=torch.float32)
+    sin = torch.randn(1, seq, dim, device="cuda", dtype=torch.float32)
+    grad = torch.randn(batch, heads, seq, dim, device="cuda", dtype=torch.float16)
+
+    x_ref = x0.clone().requires_grad_(True)
+    ref = _rope_reference(x_ref, cos, sin).half()  # what autocast feeds the attention
+    ref.backward(grad)
+
+    x_new = x0.clone().requires_grad_(True)
+    out = rope(x_new, cos, sin, torch.float16)
+    out.backward(grad)
+
+    assert out.dtype == torch.float16 and x_new.grad.dtype == torch.float16
+    torch.testing.assert_close(out.float(), ref.float(), rtol=2e-3, atol=2e-3)
+    torch.testing.assert_close(x_new.grad.float(), x_ref.grad.float(), rtol=1e-2, atol=1e-2)

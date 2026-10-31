@@ -19,11 +19,12 @@ import triton
 import triton.language as tl
 
 
-# T (tokens) changes every batch and H differs between q and k: no separate compile per value
-@triton.jit(do_not_specialize=["H", "T"])
+# T (tokens) changes every batch, H differs between q and k, and INVERSE picks forward/backward:
+# none of them gets a separate compiled copy (forward and backward share one)
+@triton.jit(do_not_specialize=["H", "T", "INVERSE"])
 def rope_kernel(x_ptr, cos_ptr, sin_ptr, y_ptr, H, T,
-                sxb, sxh, sxt, syb, syh, syt, scb, sct,
-                HALF: tl.constexpr, INVERSE: tl.constexpr):
+                sxb, sxh, sxt, syb, syh, syt, scb, sct, INVERSE,
+                HALF: tl.constexpr):
     pid = tl.program_id(0)  # one program per (batch, head, position)
     t = pid % T
     bh = pid // T
@@ -39,7 +40,7 @@ def rope_kernel(x_ptr, cos_ptr, sin_ptr, y_ptr, H, T,
     c2 = tl.load(cos_ptr + c_off + HALF + cols).to(tl.float32)
     s1 = tl.load(sin_ptr + c_off + cols).to(tl.float32)
     s2 = tl.load(sin_ptr + c_off + HALF + cols).to(tl.float32)
-    if INVERSE:
+    if INVERSE != 0:
         y1 = x1 * c1 + x2 * s2
         y2 = x2 * c2 - x1 * s1
     else:
@@ -61,16 +62,17 @@ def _rope_launch(x, cos, sin, out_dtype, inverse):
     rope_kernel[(batch * heads * seq,)](
         x, cos, sin, y, heads, seq,
         x.stride(0), x.stride(1), x.stride(2), y.stride(0), y.stride(1), y.stride(2),
-        scb, cos.stride(1),
-        HALF=dim // 2, INVERSE=inverse, num_warps=1,
+        scb, cos.stride(1), 1 if inverse else 0,
+        HALF=dim // 2, num_warps=1,
     )
     return y
 
 
 class RopeFn(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, cos, sin):
-        out_dtype = torch.promote_types(torch.promote_types(x.dtype, cos.dtype), sin.dtype)
+    def forward(ctx, x, cos, sin, out_dtype=None):
+        if out_dtype is None:  # PyTorch's promotion, as in the original
+            out_dtype = torch.promote_types(torch.promote_types(x.dtype, cos.dtype), sin.dtype)
         ctx.save_for_backward(cos, sin)
         ctx.x_dtype = x.dtype
         return _rope_launch(x, cos, sin, out_dtype, inverse=False)
@@ -78,16 +80,16 @@ class RopeFn(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         cos, sin = ctx.saved_tensors
-        return _rope_launch(grad, cos, sin, ctx.x_dtype, inverse=True), None, None
+        return _rope_launch(grad, cos, sin, ctx.x_dtype, inverse=True), None, None, None
 
 
-def rope(x, cos, sin):
-    """x: [B, H, T, D]; cos, sin: [B or 1, T, D]."""
+def rope(x, cos, sin, out_dtype=None):
+    """x: [B, H, T, D]; cos, sin: [B or 1, T, D]. out_dtype=None follows PyTorch's promotion."""
     if cos.stride(-1) != 1:
         cos = cos.contiguous()
     if sin.stride(-1) != 1:
         sin = sin.contiguous()
-    return RopeFn.apply(x, cos, sin)
+    return RopeFn.apply(x, cos, sin, out_dtype)
 
 
 def patch_qwen2_rope():
@@ -106,6 +108,14 @@ def patch_qwen2_rope():
         )
         if not supported:
             return original(q, k, cos, sin, unsqueeze_dim)
-        return rope(q, cos, sin), rope(k, cos, sin)
+        # Under fp16 autocast the attention casts q and k to fp16 anyway: write fp16 directly (the
+        # math stays fp32 with one rounding, the same value autocast would produce), so the cast
+        # kernels disappear and the backward pass uses the same dtypes as the forward.
+        out = None
+        if (q.dtype == torch.float16 and k.dtype == torch.float16
+                and torch.is_autocast_enabled("cuda")
+                and torch.get_autocast_dtype("cuda") == torch.float16):
+            out = torch.float16
+        return rope(q, cos, sin, out), rope(k, cos, sin, out)
 
     modeling_qwen2.apply_rotary_pos_emb = apply_rotary_pos_emb
