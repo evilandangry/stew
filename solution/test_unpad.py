@@ -70,6 +70,8 @@ def test_unpadded_qwen2_matches_the_padded_forward_and_backward(lengths):
     ref = unpad._ORIG_MODEL_FORWARD(model, input_ids=ids, attention_mask=am,
                                     use_cache=False).last_hidden_state
     out = model(input_ids=ids, attention_mask=am, use_cache=False).last_hidden_state
+    assert not any("fused kernel unavailable" in msg for msg in unpad._SAID), \
+        "per-row attention fell back to the slow math kernel"
     assert out.shape == ref.shape
     torch.testing.assert_close(out[m], ref[m], rtol=1e-4, atol=1e-5)
     assert torch.all(out[~m] == 0)

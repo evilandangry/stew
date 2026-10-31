@@ -104,6 +104,44 @@ def _to_padded(t, c):
     return full.view(c["B"], c["T"], heads, D).transpose(1, 2)
 
 
+def _sdpa_fast(q, k, v, causal, scale, dropout):
+    """PyTorch SDPA restricted to its fused kernels (the 'math' fallback stores full attention
+    matrices). If they cannot run, fall back once and say so in the log."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    try:
+        with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
+            return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout, scale=scale,
+                                                  is_causal=causal)
+    except RuntimeError:
+        _say("per-row attention: fused kernel unavailable, using PyTorch's default")
+        return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout, scale=scale,
+                                              is_causal=causal)
+
+
+def _per_row_attention(module, query, key, value, lens, kwargs):
+    """Causal attention row by row on the packed tokens; returns [1, N, heads, D] like
+    transformers' sdpa_attention_forward. k and v are expanded to all heads first (as the padded
+    path does), because asking SDPA for its GQA mode would push it onto the slow math kernel."""
+    from transformers.integrations.sdpa_attention import repeat_kv
+
+    groups = getattr(module, "num_key_value_groups", 1)
+    scale = kwargs.get("scaling")
+    dropout = kwargs.get("dropout", 0.0) or 0.0
+    outs, start = [], 0
+    for length in lens:
+        if length == 0:
+            continue
+        end = start + length
+        q, k, v = query[:, :, start:end], key[:, :, start:end], value[:, :, start:end]
+        if groups > 1:
+            k, v = repeat_kv(k, groups), repeat_kv(v, groups)
+        out = _sdpa_fast(q, k, v, length > 1, scale, dropout)  # [1, heads, length, D]
+        outs.append(out.transpose(1, 2))
+        start = end
+    return torch.cat(outs, dim=1).contiguous()
+
+
 def _make_sdpa(orig_sdpa):
     def sdpa(module, query, key, value, attention_mask, *args, **kwargs):
         c = _ctx()
@@ -111,16 +149,7 @@ def _make_sdpa(orig_sdpa):
             return orig_sdpa(module, query, key, value, attention_mask, *args, **kwargs)
         lens = c.get("lens")
         if lens:  # right-padded batch: one causal attention per row, on its real tokens only
-            outs, start = [], 0
-            for length in lens:
-                if length == 0:
-                    continue
-                end = start + length
-                out, _ = orig_sdpa(module, query[:, :, start:end], key[:, :, start:end],
-                                   value[:, :, start:end], None, *args, **kwargs)
-                outs.append(out)  # [1, length, heads, D]
-                start = end
-            return (outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)), None
+            return _per_row_attention(module, query, key, value, lens, kwargs), None
         out, weights = orig_sdpa(module, _to_padded(query, c), _to_padded(key, c),
                                  _to_padded(value, c), attention_mask, *args, **kwargs)
         heads, D = out.shape[2], out.shape[3]  # out: [B, T, heads, D]
