@@ -103,7 +103,9 @@ def patch_qwen2_rmsnorm():
         w = self.weight
         if (hidden_states.is_cuda and w.is_cuda and not w.requires_grad
                 and hidden_states.dtype in _SUPPORTED and w.dtype in _SUPPORTED
-                and w.is_contiguous()):
+                and w.is_contiguous() and getattr(self, "_soup_fp16_out", False)):
+            # decoder-layer norms only: the one final norm per step stays on the original code,
+            # which saves compiling a second (fp32-output) copy of both kernels
             eps = getattr(self, "variance_epsilon", getattr(self, "eps", 1e-6))
             out16 = (getattr(self, "_soup_fp16_out", False)
                      and hidden_states.dtype == torch.float32

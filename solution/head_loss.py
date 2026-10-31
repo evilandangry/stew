@@ -98,7 +98,7 @@ class _HeadCE(torch.autograd.Function):
         return ctx.dh * gout.to(ctx.dh.dtype), None, None, None, None, None
 
 
-def fused_head_ce(h, w, tgt, denom, chunk=512):
+def fused_head_ce(h, w, tgt, denom, chunk=256):
     """h [N,H], w [V,H] (frozen), tgt [N] (-100 = no loss). Returns (loss, stats)."""
     sink = {}
     loss = _HeadCE.apply(h, w, tgt, sink, float(denom), chunk)

@@ -135,3 +135,37 @@ def test_left_padded_batch_uses_the_padded_attention_path():
         pytest.skip("the original forward itself is not finite here")
     out = model(input_ids=ids, attention_mask=am, use_cache=False).last_hidden_state
     torch.testing.assert_close(out[m], ref[m], rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("autocast", [False, True])
+def test_row_attention_with_shared_kv_heads_matches_repeated_kv(autocast):
+    import warnings
+
+    from transformers.integrations.sdpa_attention import repeat_kv
+
+    from solution import unpad
+
+    torch.manual_seed(0)
+    L, hq, hkv, D = 77, 12, 2, 128
+    groups = hq // hkv
+    # the layout of the packed q/k/v: [1, N, H, D] viewed as [1, H, N, D]
+    q0 = torch.randn(1, L, hq, D, device="cuda").transpose(1, 2)
+    k0 = torch.randn(1, L, hkv, D, device="cuda").transpose(1, 2)
+    v0 = torch.randn(1, L, hkv, D, device="cuda").transpose(1, 2)
+    g = torch.randn(1, hq, L, D, device="cuda")
+
+    def run(fn):
+        q, k, v = (t.detach().clone().requires_grad_(True) for t in (q0, k0, v0))
+        with torch.autocast("cuda", dtype=torch.float16, enabled=autocast):
+            out = fn(q, k, v)
+        out.float().backward(g)
+        return out.float(), q.grad, k.grad, v.grad
+
+    ref = run(lambda q, k, v: F.scaled_dot_product_attention(
+        q, repeat_kv(k, groups), repeat_kv(v, groups), is_causal=True))
+    got = run(lambda q, k, v: unpad._row_attention(q, k, v, groups, True, None, 0.0))
+    tol = 2e-2 if autocast else 1e-4
+    for a, b in zip(ref, got):
+        torch.testing.assert_close(b, a, rtol=tol, atol=tol)
+    if not unpad._BROADCAST_KV[0]:
+        warnings.warn("the fused kernel rejected the zero-copy k/v layout; the copy path was tested")

@@ -119,12 +119,51 @@ def _sdpa_fast(q, k, v, causal, scale, dropout):
                                               is_causal=causal)
 
 
-def _per_row_attention(module, query, key, value, lens, kwargs):
-    """Causal attention row by row on the packed tokens; returns [1, N, heads, D] like
-    transformers' sdpa_attention_forward. k and v are expanded to all heads first (as the padded
-    path does), because asking SDPA for its GQA mode would push it onto the slow math kernel."""
+_BROADCAST_KV = [True]  # becomes False if the fused kernel rejects the zero-copy k/v layout
+
+
+def _sdpa_strict(q, k, v, causal, scale, dropout):
+    """Fused SDPA kernels only; raises if none can run (no silent math fallback)."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+
+    with sdpa_kernel([SDPBackend.EFFICIENT_ATTENTION, SDPBackend.FLASH_ATTENTION]):
+        return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout, scale=scale,
+                                              is_causal=causal)
+
+
+def _row_attention(q, k, v, groups, causal, scale, dropout):
+    """One row: q [1, Hq, L, D], k/v [1, Hkv, L, D] -> [1, Hq, L, D].
+
+    Grouped-query attention without copying k/v: the query heads are arranged as
+    [Hkv, groups, L, D] (head h = g * groups + r uses kv head g, the order repeat_kv uses) and each
+    kv head is broadcast over its group with a zero-copy view. SDPA then keeps only the 2-head k/v
+    for the backward pass instead of a 12-head copy. Inputs are cast to the autocast dtype first
+    (the cast autocast would do anyway), so autocast does not make a dense copy of the view.
+    If the fused kernel rejects this layout, k/v are copied to all heads instead."""
     from transformers.integrations.sdpa_attention import repeat_kv
 
+    if groups > 1 and _BROADCAST_KV[0]:
+        if torch.is_autocast_enabled("cuda"):
+            dt = torch.get_autocast_dtype("cuda")
+            q, k, v = q.to(dt), k.to(dt), v.to(dt)
+        hkv, L, D = k.shape[1], q.shape[2], q.shape[3]
+        qg = q.reshape(hkv, groups, L, D)
+        kg = k.reshape(hkv, 1, L, D).expand(hkv, groups, L, D)
+        vg = v.reshape(hkv, 1, L, D).expand(hkv, groups, L, D)
+        try:
+            return _sdpa_strict(qg, kg, vg, causal, scale, dropout).reshape(1, hkv * groups, L, D)
+        except RuntimeError:
+            _BROADCAST_KV[0] = False
+            _say("per-row attention: zero-copy k/v not supported by the fused kernel, copying")
+    if groups > 1:
+        k, v = repeat_kv(k, groups), repeat_kv(v, groups)
+    return _sdpa_fast(q, k, v, causal, scale, dropout)
+
+
+def _per_row_attention(module, query, key, value, lens, kwargs):
+    """Causal attention row by row on the packed tokens; returns [1, N, heads, D] like
+    transformers' sdpa_attention_forward. (Asking SDPA for its own GQA mode would push it onto
+    the slow math kernel on a T4, so grouped heads are handled in _row_attention.)"""
     groups = getattr(module, "num_key_value_groups", 1)
     scale = kwargs.get("scaling")
     dropout = kwargs.get("dropout", 0.0) or 0.0
@@ -133,11 +172,9 @@ def _per_row_attention(module, query, key, value, lens, kwargs):
         if length == 0:
             continue
         end = start + length
-        q, k, v = query[:, :, start:end], key[:, :, start:end], value[:, :, start:end]
-        if groups > 1:
-            k, v = repeat_kv(k, groups), repeat_kv(v, groups)
-        out = _sdpa_fast(q, k, v, length > 1, scale, dropout)  # [1, heads, length, D]
-        outs.append(out.transpose(1, 2))
+        out = _row_attention(query[:, :, start:end], key[:, :, start:end],
+                             value[:, :, start:end], groups, length > 1, scale, dropout)
+        outs.append(out.transpose(1, 2))  # [1, length, heads, D]
         start = end
     return torch.cat(outs, dim=1).contiguous()
 

@@ -19,7 +19,8 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# T (tokens) changes every batch and H differs between q and k: no separate compile per value
+@triton.jit(do_not_specialize=["H", "T"])
 def rope_kernel(x_ptr, cos_ptr, sin_ptr, y_ptr, H, T,
                 sxb, sxh, sxt, syb, syh, syt, scb, sct,
                 HALF: tl.constexpr, INVERSE: tl.constexpr):
