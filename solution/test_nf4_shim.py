@@ -1,7 +1,7 @@
 """Our dequantize_4bit replacement behaves like bitsandbytes for a (1, n) packed view too.
 
 bitsandbytes has a compatibility rule: a packed weight passed as a (1, n) view gets its result
-transposed back. (Spotted by Shadiyar.) The training run never passes such a view, but the
+transposed back. The training run never passes such a view, but the
 replacement should match the original everywhere.
 """
 import sys

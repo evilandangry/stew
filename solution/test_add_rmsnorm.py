@@ -1,4 +1,4 @@
-"""Fused residual add + post-attention RMSNorm (Shadiyar's kernel) against plain PyTorch."""
+"""Fused residual add + post-attention RMSNorm against plain PyTorch."""
 import pytest
 import torch
 

@@ -105,3 +105,31 @@ def test_no_padding_and_eval_use_the_original_path():
         b = unpad._ORIG_MODEL_FORWARD(model, input_ids=ids, attention_mask=am,
                                       use_cache=False).last_hidden_state
         torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+
+def test_left_padded_batch_uses_the_padded_attention_path():
+    """Not right-padded: the per-row shortcut must not be used; the masked padded path still
+    gives the same result as the original forward on the real tokens."""
+    from transformers import Qwen2Config
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
+
+    from solution import unpad
+
+    unpad.patch_unpad()
+    torch.manual_seed(0)
+    cfg = Qwen2Config(vocab_size=500, hidden_size=128, intermediate_size=256, num_hidden_layers=2,
+                      num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=256,
+                      attn_implementation="sdpa")
+    model = Qwen2Model(cfg).cuda().train()
+    B, T = 3, 40
+    ids = torch.randint(0, 500, (B, T), device="cuda")
+    am = torch.zeros(B, T, dtype=torch.long, device="cuda")
+    for b, n in enumerate([40, 25, 9]):
+        am[b, T - n:] = 1  # left padding
+    m = am.bool()
+    ref = unpad._ORIG_MODEL_FORWARD(model, input_ids=ids, attention_mask=am,
+                                    use_cache=False).last_hidden_state
+    if not torch.isfinite(ref[m]).all():
+        pytest.skip("the original forward itself is not finite here")
+    out = model(input_ids=ids, attention_mask=am, use_cache=False).last_hidden_state
+    torch.testing.assert_close(out[m], ref[m], rtol=1e-4, atol=1e-5)

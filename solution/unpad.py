@@ -10,9 +10,11 @@ How (the math for real tokens is unchanged; only where the data sits changes):
   The attention mask is built from the padded shape with transformers' own create_causal_mask,
   exactly as before. At the end the hidden states are scattered back to [B, T, H] (zeros in the
   padding), so the loss code downstream sees the usual layout.
-- Attention is the one step that needs the batch layout: around transformers' SDPA function,
-  q, k and v are scattered back to [B, heads, T, D], the same masked attention runs, and the real
-  rows are gathered out again.
+- Attention: when every row is right-padded (TRL's collator pads on the right), each row's real
+  tokens sit together in the packed tensor, so transformers' SDPA function runs once per row on
+  just that row: plain causal attention, no mask, no padding (less work, since attention grows
+  with length squared). Otherwise q, k and v are scattered back to [B, heads, T, D], the same
+  masked attention runs, and the real rows are gathered out again.
 - LoRA dropout: the random mask is drawn on a padded tensor of the same shape and dtype the base
   run draws it on, so the random numbers are the same as the base, then packed, and applied to
   the packed tokens (fp32 math, one rounding, exactly like PyTorch's dropout).
@@ -107,6 +109,18 @@ def _make_sdpa(orig_sdpa):
         c = _ctx()
         if c is None or query.dim() != 4 or query.shape[0] != 1 or query.shape[2] != c["n"]:
             return orig_sdpa(module, query, key, value, attention_mask, *args, **kwargs)
+        lens = c.get("lens")
+        if lens:  # right-padded batch: one causal attention per row, on its real tokens only
+            outs, start = [], 0
+            for length in lens:
+                if length == 0:
+                    continue
+                end = start + length
+                out, _ = orig_sdpa(module, query[:, :, start:end], key[:, :, start:end],
+                                   value[:, :, start:end], None, *args, **kwargs)
+                outs.append(out)  # [1, length, heads, D]
+                start = end
+            return (outs[0] if len(outs) == 1 else torch.cat(outs, dim=1)), None
         out, weights = orig_sdpa(module, _to_padded(query, c), _to_padded(key, c),
                                  _to_padded(value, c), attention_mask, *args, **kwargs)
         heads, D = out.shape[2], out.shape[3]  # out: [B, T, heads, D]
@@ -169,27 +183,40 @@ def patch_unpad():
                 _say(f"original path ({why})")
             return original()
         B, T = input_ids.shape
-        idx = attention_mask.reshape(-1).bool().nonzero().squeeze(1)
-        n = idx.numel()
+        am = attention_mask.bool()
+        lengths = am.sum(1)
+        right = (am == (torch.arange(T, device=am.device)[None, :] < lengths[:, None])).all()
+        info = torch.cat([right.view(1).long(), lengths.long()]).tolist()  # the one sync
+        right, lens = bool(info[0]), info[1:]
+        n = sum(lens)
         if n == B * T or n == 0:
             return original()  # nothing to skip
+        if right:  # real tokens of row b are positions 0 .. lens[b]-1
+            idx = torch.cat([torch.arange(length, device=am.device) + b * T
+                             for b, length in enumerate(lens) if length > 0])
+        else:
+            idx = am.reshape(-1).nonzero().squeeze(1)
+            lens = None
         if position_ids is None:
             position_ids = torch.arange(T, device=input_ids.device).unsqueeze(0)
         pos = position_ids.expand(B, T).reshape(-1).index_select(0, idx).unsqueeze(0)
 
         embeds = self.embed_tokens(input_ids.reshape(-1).index_select(0, idx).unsqueeze(0))
-        like = embeds.new_zeros(1).expand(B, T, 1)  # shape and dtype of the padded embeddings
-        mask = Q.create_causal_mask(config=self.config, inputs_embeds=like,
-                                    attention_mask=attention_mask, past_key_values=None,
-                                    position_ids=position_ids)
-        if mask is None:
-            return original()
+        mask = None  # per-row attention needs no mask
+        if lens is None:
+            like = embeds.new_zeros(1).expand(B, T, 1)  # shape and dtype of the padded embeddings
+            mask = Q.create_causal_mask(config=self.config, inputs_embeds=like,
+                                        attention_mask=attention_mask, past_key_values=None,
+                                        position_ids=position_ids)
+            if mask is None:
+                return original()
         rope = self.rotary_emb(embeds, pos)
         if "active" not in _SAID:
             _SAID.add("active")
-            print(f"[solution] unpad: active (first batch: {n} real tokens of {B * T} slots)")
+            print(f"[solution] unpad: active (first batch: {n} real tokens of {B * T} slots, "
+                  f"{'per-row attention' if lens else 'padded attention'})")
         kwargs.pop("return_dict", None)
-        _STATE.ctx = {"B": B, "T": T, "idx": idx, "n": n}
+        _STATE.ctx = {"B": B, "T": T, "idx": idx, "n": n, "lens": lens}
         try:
             h = embeds
             for layer in self.layers[: self.config.num_hidden_layers]:
