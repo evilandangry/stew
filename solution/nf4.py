@@ -104,7 +104,9 @@ def patch_bnb_dequant():
         global _BROKEN
         if (not _BROKEN and absmax is None and out is None and _supported(A, quant_state)):
             try:
-                return dequantize_nf4(A, quant_state)
+                out_ = dequantize_nf4(A, quant_state)
+                # like bitsandbytes: a (1, n) packed view gets the result transposed back
+                return out_.t() if A.shape[0] == 1 else out_
             except Exception:  # never break training because of the speed-up
                 _BROKEN = True
         return orig(A, quant_state, absmax, out, blocksize, quant_type)
