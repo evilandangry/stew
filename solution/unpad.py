@@ -46,7 +46,7 @@ def _mark(label):
     except Exception:  # noqa: BLE001
         pass
 
-MLP_TOKEN_BUDGET = 700  # tokens' worth of full MLP activations kept per layer at the peak
+MLP_TOKEN_BUDGET = 1000  # tokens' worth of full MLP activations kept per layer at the peak
 _MLP_SAVED_SHARE = 0.63  # share of a layer's saved activations that recomputing gate/up removes
 
 
