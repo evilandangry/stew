@@ -10,8 +10,8 @@
 ## Team (up to 4 people)
 | Name | Role | GitHub | Kaggle | Contact (captain) |
 |---|---|---|---|---|
-| Yerkhan Serik | captain: kernels, integration, measurement, README | evilandangry | yerser | Telegram @metalballadlover |
-| Shadiyar Musin | core solution: fused LM head + loss, fp16 norm path, NF4, fp16 embedding, fused add-norm | — | — | |
+| Yerkhan Serik | captain: padding removal, per-row and zero-copy attention, MLP recompute cap, NF4 unpack on both passes, RoPE, fp16 embedding, kernel-share fix; profiling, verification, README | evilandangry | yerser | Telegram @metalballadlover |
+| Shadiyar Musin | starting point: fused LM head + loss, fp16 norm path, first NF4 kernel; fused add-norm | — | — | |
 | Madiyar Komilzhonov | presentation | — | — | |
 | Mansur Utepbergen | team member | — | — | |
 

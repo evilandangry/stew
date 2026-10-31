@@ -31,9 +31,15 @@ same for the base and for us. That's why the whole command gains less than the t
 
 Two of us went at it separately at first. Yerkhan wrote the first set of kernels (fused loss, NF4
 unpacking, RMSNorm, RoPE): 1.53× less memory, but no speed at all. Shadiyar came back the same
-evening with a different idea: never build the logits table at all.
-That gave 2.27× memory and 1.18× speed, so his version became the base and we built everything else
-on top of it, through the night and the next morning.
+evening with a different idea: never build the logits table at all. That gave 2.27× memory and
+1.18× speed, so his version became the starting point.
+
+It had two weak spots. Our own kernels took only 6.3 % of the training time against a 5 % minimum
+(the harness flagged it: a different seed could fail the check), and bitsandbytes' own unpack kernel
+still ran in every forward pass next to ours. Yerkhan fixed both, then spent the night and the next
+morning taking it from 2.27× / 1.18× to **4.18× / 1.36×**: padding removal, per-row and zero-copy
+attention, the MLP recompute cap, the faster NF4 unpack on both passes, RoPE, the fp16 embedding,
+and every profile, memory audit and verification run behind the table below.
 
 The rule we kept: measure first, change one thing, run the full checks, keep it only if it passes
 and helps. Every row in the [results table](#3-results-and-limitations) is one of those runs.
@@ -162,13 +168,13 @@ Speedup is against the base run of the same session.
 |---|---|---|---|---|---|
 | Base Soup (average of 15 runs, 75.9–86.1 s) | 78.5 s | 1.00× | 14,345 MiB | 1.00× | |
 | Yerkhan's first solution: fused loss, NF4, RMSNorm, RoPE, fp16 SwiGLU | 78.3 s | 0.99× | 9,384 MiB | 1.53× | 11.8 % |
-| Shadiyar's solution: fused LM head + loss, fp16 norm path, NF4 | 66.6 s | 1.18× | 6,323 MiB | 2.27× | 6.3 % |
-| + fp16 tied embedding | 69.2 s | 1.15× | 5,423 MiB | 2.65× | 5.9 % |
+| Shadiyar's solution: fused LM head + loss, fp16 norm path, NF4 (the starting point) | 66.6 s | 1.18× | 6,323 MiB | 2.27× | 6.3 % |
+| *from here on: Yerkhan*, + fp16 tied embedding | 69.2 s | 1.15× | 5,423 MiB | 2.65× | 5.9 % |
 | + RoPE kernel | 65.3 s | 1.19× | 5,421 MiB | 2.65× | 7.8 % |
 | + NF4 kernel on the forward matmul | 65.7 s | 1.18× | 5,421 MiB | 2.65× | 12.3 % |
 | + faster NF4 unpack | 65.0 s | 1.20× | 5,421 MiB | 2.65× | 9.2 % |
 | + padding removal | 58.0 s | 1.35× | 4,801 MiB | 2.99× | 12.3 % |
-| + fused add-norm | 56.1 s | 1.35× | 4,861 MiB | 2.95× | 12.1 % |
+| + fused add-norm (Shadiyar) | 56.1 s | 1.35× | 4,861 MiB | 2.95× | 12.1 % |
 | + per-row attention | 55.8 s | 1.43× | 4,367 MiB | 3.29× | 13.2 % |
 | + zero-copy GQA, fewer compiles, smaller head chunks | 55.3 s | 1.37× | 4,013 MiB | 3.58× | 12.2 % |
 | + MLP recompute on dense batches | 55.5 s | 1.39× | 3,433 MiB | 4.18× | 12.6 % |
@@ -204,8 +210,8 @@ about 0.45–0.5 s (the base's median step: 0.88 s).
 
 | Name | Role | GitHub | Kaggle | Telegram |
 |---|---|---|---|---|
-| Yerkhan Serik (captain) | kernels, integration, measurement, README | [evilandangry](https://github.com/evilandangry) | [yerser](https://www.kaggle.com/yerser) | [@metalballadlover](https://t.me/metalballadlover) |
-| Shadiyar Musin | the core solution: fused LM head + loss, fp16 norm path, NF4, fp16 embedding, fused add-norm; also the team name | — | — | — |
+| Yerkhan Serik (captain) | took the merged solution from 2.27× / 1.18× to 4.18× / 1.36×: padding removal, per-row and zero-copy attention, MLP recompute cap, NF4 unpack on both passes, RoPE, fp16 embedding, fixed the kernel-share margin; profiling, every verification run, README | [evilandangry](https://github.com/evilandangry) | [yerser](https://www.kaggle.com/yerser) | [@metalballadlover](https://t.me/metalballadlover) |
+| Shadiyar Musin | the starting point: fused LM head + loss, fp16 norm path, first NF4 kernel; later the fused add-norm; also the team name | — | — | — |
 | Madiyar Komilzhonov | presentation | — | — | — |
 | Mansur Utepbergen | team member | — | — | — |
 
