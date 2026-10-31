@@ -88,7 +88,9 @@ def test_unpadded_qwen2_matches_the_padded_forward_and_backward(lengths):
         torch.testing.assert_close(b, a, rtol=1e-3, atol=1e-4)
 
 
-def test_no_padding_and_eval_use_the_original_path():
+def test_no_padding_batch_and_eval():
+    """A batch without padding also takes the packed path in training (same result within
+    rounding); eval always runs the original code (identical)."""
     from transformers import Qwen2Config
     from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
 
@@ -106,7 +108,8 @@ def test_no_padding_and_eval_use_the_original_path():
         a = model(input_ids=ids, attention_mask=am, use_cache=False).last_hidden_state
         b = unpad._ORIG_MODEL_FORWARD(model, input_ids=ids, attention_mask=am,
                                       use_cache=False).last_hidden_state
-        torch.testing.assert_close(a, b, rtol=0, atol=0)
+        tol = 1e-4 if train else 0.0
+        torch.testing.assert_close(a, b, rtol=tol, atol=tol / 10)
 
 
 def test_left_padded_batch_uses_the_padded_attention_path():
@@ -169,3 +172,42 @@ def test_row_attention_with_shared_kv_heads_matches_repeated_kv(autocast):
         torch.testing.assert_close(b, a, rtol=tol, atol=tol)
     if not unpad._BROADCAST_KV[0]:
         warnings.warn("the fused kernel rejected the zero-copy k/v layout; the copy path was tested")
+
+
+def test_mlp_recompute_gives_the_same_result():
+    """With the budget at 1 token every layer recomputes gate/up in the backward pass; outputs and
+    gradients must match the original forward."""
+    from transformers import Qwen2Config
+    from transformers.models.qwen2.modeling_qwen2 import Qwen2Model
+
+    from solution import unpad
+
+    unpad.patch_unpad()
+    saved = unpad.MLP_TOKEN_BUDGET
+    unpad.MLP_TOKEN_BUDGET = 1
+    try:
+        assert unpad._mlp_recompute_layers(74, 2) == 2
+        torch.manual_seed(0)
+        cfg = Qwen2Config(vocab_size=500, hidden_size=128, intermediate_size=256,
+                          num_hidden_layers=2, num_attention_heads=4, num_key_value_heads=2,
+                          max_position_embeddings=256, attn_implementation="sdpa")
+        model = Qwen2Model(cfg).cuda().train()
+        B, T = 3, 40
+        ids = torch.randint(0, 500, (B, T), device="cuda")
+        am = _right_padded_mask(B, T, [40, 25, 9])
+        m = am.bool()
+        ref = unpad._ORIG_MODEL_FORWARD(model, input_ids=ids, attention_mask=am,
+                                        use_cache=False).last_hidden_state
+        out = model(input_ids=ids, attention_mask=am, use_cache=False).last_hidden_state
+        torch.testing.assert_close(out[m], ref[m], rtol=1e-4, atol=1e-5)
+        params = [p for p in model.parameters() if p.requires_grad]
+        w = torch.randn_like(ref)
+        g_ref = torch.autograd.grad((ref[m] * w[m]).sum(), params, allow_unused=True)
+        g_out = torch.autograd.grad((out[m] * w[m]).sum(), params, allow_unused=True)
+        for a, b in zip(g_ref, g_out):
+            if a is None or b is None:
+                assert a is None and b is None
+                continue
+            torch.testing.assert_close(b, a, rtol=1e-3, atol=1e-4)
+    finally:
+        unpad.MLP_TOKEN_BUDGET = saved

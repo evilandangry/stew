@@ -18,9 +18,15 @@ How (the math for real tokens is unchanged; only where the data sits changes):
 - LoRA dropout: the random mask is drawn on a padded tensor of the same shape and dtype the base
   run draws it on, so the random numbers are the same as the base, then packed, and applied to
   the packed tokens (fp32 math, one rounding, exactly like PyTorch's dropout).
-Anything unusual (no padding, eval, caches, sliding windows, extra outputs requested) runs the
-original code.
+- MLP memory cap: the peak is set by the densest batch, and the MLP's saved gate/up tensors are
+  most of a layer's saved activations. For a batch with more real tokens than MLP_TOKEN_BUDGET,
+  just enough layers recompute gate/up in the backward pass (checkpointing x only) to keep that
+  batch's saved activations at the level of a MLP_TOKEN_BUDGET-token batch. Smaller batches
+  recompute nothing. The recompute uses the same kernels, so gradients are unchanged; its time
+  counts in the measured run.
+Anything unusual (eval, caches, sliding windows, extra outputs requested) runs the original code.
 """
+import math
 import threading
 
 import torch
@@ -29,6 +35,23 @@ import torch.nn.functional as F
 _STATE = threading.local()
 _SAID = set()
 _ORIG_MODEL_FORWARD = None
+_MAX_N = [0]
+
+MLP_TOKEN_BUDGET = 1000  # tokens' worth of full MLP activations kept per layer at the peak
+_MLP_SAVED_SHARE = 0.63  # share of a layer's saved activations that recomputing gate/up removes
+
+
+def _mlp_recompute_layers(n, layers):
+    """How many of `layers` layers recompute gate/up for a batch of n real tokens."""
+    if n <= MLP_TOKEN_BUDGET:
+        return 0
+    return min(layers, math.ceil(layers * (n - MLP_TOKEN_BUDGET) / (n * _MLP_SAVED_SHARE)))
+
+
+def _gate_up(mlp, x):
+    from .swiglu import swiglu
+
+    return swiglu(mlp.gate_proj(x), mlp.up_proj(x))
 
 
 def _say(msg):
@@ -255,8 +278,8 @@ def patch_unpad():
         info = torch.cat([right.view(1).long(), lengths.long()]).tolist()  # the one sync
         right, lens = bool(info[0]), info[1:]
         n = sum(lens)
-        if n == B * T or n == 0:
-            return original()  # nothing to skip
+        if n == 0:
+            return original()
         if right:  # real tokens of row b are positions 0 .. lens[b]-1
             idx = torch.cat([torch.arange(length, device=am.device) + b * T
                              for b, length in enumerate(lens) if length > 0])
@@ -282,7 +305,14 @@ def patch_unpad():
             print(f"[solution] unpad: active (first batch: {n} real tokens of {B * T} slots, "
                   f"{'per-row attention' if lens else 'padded attention'})")
         kwargs.pop("return_dict", None)
-        _STATE.ctx = {"B": B, "T": T, "idx": idx, "n": n, "lens": lens}
+        layers = self.config.num_hidden_layers
+        recompute = _mlp_recompute_layers(n, layers)
+        if n > _MAX_N[0]:
+            _MAX_N[0] = n
+            print(f"[solution] unpad: largest batch so far: {n} real tokens, MLP gate/up "
+                  f"recomputed in {recompute} of {layers} layers")
+        _STATE.ctx = {"B": B, "T": T, "idx": idx, "n": n, "lens": lens,
+                      "recompute": recompute, "mlp_i": 0}
         try:
             h = embeds
             for layer in self.layers[: self.config.num_hidden_layers]:
@@ -296,6 +326,28 @@ def patch_unpad():
 
     forward._soup_unpad = True
     cls.forward = forward
+
+    # MLP memory cap (wraps whatever MLP forward is installed now: the SwiGLU example)
+    from torch.utils.checkpoint import checkpoint
+
+    mlp_cls = Q.Qwen2MLP
+    if not getattr(mlp_cls.forward, "_soup_unpad", False):
+        prev_mlp = mlp_cls.forward
+
+        def mlp_forward(self, x):
+            c = _ctx()
+            if c is None or not c.get("recompute"):
+                return prev_mlp(self, x)
+            i = c["mlp_i"]
+            c["mlp_i"] = i + 1
+            act = getattr(getattr(self, "config", None), "hidden_act", "silu")
+            if (i >= c["recompute"] or act != "silu" or not x.is_cuda
+                    or not torch.is_grad_enabled() or not x.requires_grad):
+                return prev_mlp(self, x)
+            return self.down_proj(checkpoint(_gate_up, self, x, use_reentrant=False))
+
+        mlp_forward._soup_unpad = True
+        mlp_cls.forward = mlp_forward
 
     # LoRA dropout modules exist only once Soup has built the PEFT model
     from soup_cli.trainer.sft import SFTTrainerWrapper
