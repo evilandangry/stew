@@ -1,9 +1,10 @@
 # Submission: NaVi
 
 ## Links
-- Repository, final commit: https://github.com/BAITC-Hacks/hack-4df528e9-navi/commit/TODO
+- Repository, final commit of the code: https://github.com/BAITC-Hacks/hack-4df528e9-navi/commit/8e63d40ec6e1165aaac782d429aa758546ad2b2d
+  (later commits only update README.md and SUBMISSION.md; `solution/` is unchanged)
 - Public Kaggle notebook, the saved version (`COMMIT` in it = the sha above; the same link is in our
-  README): https://www.kaggle.com/code/yerser/TODO?scriptVersionId=TODO
+  README): https://www.kaggle.com/code/yerser/notebookf01887514d
 - Demo video (up to 3 minutes): TODO
 - Presentation: TODO
 
@@ -11,23 +12,24 @@
 | Name | Role | GitHub | Kaggle | Contact (captain) |
 |---|---|---|---|---|
 | Yerkhan Serik | captain: padding removal, per-row and zero-copy attention, MLP recompute cap, NF4 unpack on both passes, RoPE, fp16 embedding, kernel-share fix; profiling, verification, README | evilandangry | yerser | Telegram @metalballadlover |
-| Shadiyar Musin | starting point: fused LM head + loss, fp16 norm path, first NF4 kernel; fused add-norm | — | — | |
-| Madiyar Komilzhonov | presentation | — | — | |
-| Mansur Utepbergen | team member | — | — | |
+| Shadiyar Musin | starting point: fused LM head + loss, fp16 norm path, first NF4 kernel; fused add-norm | shadiarmusin-eng | — | |
+| Madiyar Komilzhonov | presentation | forces57 | — | |
+| Mansur Utepbergen | team member | utepbergenovmansur68 | — | |
 
 ## Our kernels
-Check 4 reports the total share of our kernels: 11.8 % of the training time on the final
-code (limit 5 %). The per-kernel split below is from the GPU profile of the final code
-(16 profiled steps, `run_task.py --profile`).
-<!-- TODO: fill the per-kernel % from the final profile run -->
+Check 4 reported 12.0 % of the training time for our kernels in the saved notebook run of the final
+code `8e63d40` (12.4 % in an earlier run of the same code; limit 5 %). The split below is from that
+earlier run's `runs/result.json` (`own_kernel_ms`, CUDA events over the timed
+steps 3–64, 25.53 s): each kernel's time divided by that. These add up to 12.9 %; the check computes
+its total slightly differently. The example's SwiGLU kernels (883 ms) are not counted.
 
 | Kernel (`@triton.jit` name) | File | What it replaces | Share of the training time (check 4) |
 |---|---|---|---|
-| `_head_ce` | `solution/head_loss.py` | LM head logits + log-softmax + NLL + entropy + argmax and their backward, chunked; the 2,048 × 151,936 logits table is never stored | TODO % |
-| `_nf4_unpack` | `solution/nf4.py` | bitsandbytes' NF4 unpack (scale decode + weights) for the forward and backward matmuls of every 4-bit layer | TODO % |
-| `_rms_fwd`, `_rms_bwd` | `solution/rmsnorm.py` | Qwen2 RMSNorm (about six PyTorch ops per call), fp16 output for the projections | TODO % |
-| `_add_rms_fwd`, `_add_rms_bwd` | `solution/rmsnorm.py` | residual add + post-attention RMSNorm, plus the gradient add in the backward pass | TODO % |
-| `rope_kernel` | `solution/rope.py` | rotary embedding (`rotate_half`, cat, multiplies, add) for q and k, forward and backward | TODO % |
+| `_head_ce` | `solution/head_loss.py` | LM head logits + log-softmax + NLL + entropy + argmax and their backward, chunked; the 2,048 × 151,936 logits table is never stored | 0.8 % (214 ms) |
+| `_nf4_unpack` | `solution/nf4.py` | bitsandbytes' NF4 unpack (scale decode + weights) for the forward and backward matmuls of every 4-bit layer | 9.0 % (2,295 ms) |
+| `_rms_fwd`, `_rms_bwd` | `solution/rmsnorm.py` | Qwen2 RMSNorm (about six PyTorch ops per call), fp16 output for the projections | 0.7 % (170 ms) |
+| `_add_rms_fwd`, `_add_rms_bwd` | `solution/rmsnorm.py` | residual add + post-attention RMSNorm, plus the gradient add in the backward pass | 1.3 % (323 ms) |
+| `rope_kernel` | `solution/rope.py` | rotary embedding (`rotate_half`, cat, multiplies, add) for q and k, forward and backward | 1.1 % (287 ms) |
 
 Not launched in a normal run (fallbacks if the fused head path cannot run): `_ce_fwd`, `_ce_bwd`,
 `_entropy_fwd` in `solution/fused_ce.py`. `solution/swiglu.py` is the challenge's example, still
@@ -41,12 +43,14 @@ Liger Kernel (https://github.com/linkedin/Liger-Kernel) and Apple's Cut Cross-En
 https://arxiv.org/abs/1604.06174); the NF4 format (QLoRA, https://arxiv.org/abs/2305.14314).
 
 ## Results on Kaggle T4 (from `runs/result.json` and `runs/checks.json` of the notebook above)
-<!-- these are from the verification run of 68f44c2; replace with the saved notebook's run if it differs -->
 | | Base Soup | Ours | Ratio |
 |---|---|---|---|
-| Time of `soup train`, s | 76.68 | 56.53 | speedup 1.356x |
-| Peak GPU memory, MiB | 14,345 | 3,433 | base/ours 4.179x |
-| Eval loss (public rows) | 2.04968 | 2.04950 | -0.009 % vs base |
+| Time of `soup train`, s | 86.8 | 56.4 | speedup 1.539x |
+| Peak GPU memory, MiB | 14,345 | 3,399 | base/ours 4.220x |
+| Eval loss (public rows) | 2.04964 | 2.04954 | -0.005 % vs base |
+
+The base was slow in this run: over our 19 runs its time ranged 75.9–88.0 s (median 78.0 s), so on
+a typical run expect about 1.4× (1.38× against the median).
 
 - [x] All 10 checks of `harness/check_rules.py` passed
 - [x] README.md rewritten for our solution: what we did, how to run it, results, limits

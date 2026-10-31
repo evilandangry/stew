@@ -1,7 +1,7 @@
 # a s1mple solution
 
-**4× less memory, 1.36× faster, same model.** Soup's training run on a free Kaggle T4, rebuilt
-around our own Triton kernels.
+**4.2× less memory, about 1.4–1.5× faster, same model.** Soup's training run on a free Kaggle T4,
+rebuilt around our own Triton kernels.
 
 Team **NaVi** · Soup Kernel Challenge · Decentrathon 6.0
 
@@ -11,19 +11,23 @@ both. Everything is in `solution/`.
 
 | | Base Soup | Ours | |
 |---|---|---|---|
-| Peak GPU memory | 14,345 MiB | **3,433 MiB** | **4.18×** less |
-| Whole `soup train` command | 76.7 s | **56.5 s** | **1.36×** faster |
-| … just the training loop | 55.0 s | **34.5 s** | **1.60×** faster |
-| Eval loss (held-out rows) | 2.04968 | 2.04950 | −0.009 %, same model |
+| Peak GPU memory | 14,345 MiB | **3,399 MiB** | **4.22×** less |
+| Whole `soup train` command | 86.8 s | **56.4 s** | **1.54×** faster* |
+| Eval loss (held-out rows) | 2.04964 | 2.04954 | −0.005 %, same model |
 | All 10 checks (`harness/check_rules.py`) | | **pass** | |
 
-These come from one Kaggle T4 run of `harness/run_task.py` + `check_rules.py` on our final code
-(`68f44c2`). About 22 s of every run is loading (Python, Soup, the 4-bit model), and that part is the
-same for the base and for us. That's why the whole command gains less than the training loop does.
+These are the numbers of our **public saved Kaggle run** of the final code (`8e63d40`), the one linked
+below.
+
+\* The base's own time jumps around between runs: 75.9–88.0 s over our 19 runs, median 78.0 s, on the
+same code. This run's base was a slow one. Against the median, our 56–57 s is about **1.38×**, so
+expect 1.4–1.5× when you rerun it. About 22 s of every run is loading (Python, Soup, the 4-bit model)
+and is the same for the base and for us; in the training loop alone we are about **1.6×** faster
+(55.0 s vs 34.5 s in the verification run of `68f44c2`).
 
 ![What each step bought: peak memory and time per version](docs/progress.png)
 
-**Kaggle notebook (public, saved version):** TODO <link>
+**Kaggle notebook (public, saved version):** [NaVi team's notebook](https://www.kaggle.com/code/yerser/notebookf01887514d), which runs commit [`8e63d40`](https://github.com/BAITC-Hacks/hack-4df528e9-navi/commit/8e63d40ec6e1165aaac782d429aa758546ad2b2d). Press Run All to reproduce.
 
 ---
 
@@ -73,7 +77,9 @@ padded [4, T, 1536]  ──pack──►  [1, N_real, 1536]  ── 28 layers �
 
 - **Attention, one row at a time.** TRL pads on the right, so each row's tokens sit together.
   PyTorch's fused attention runs once per row with plain causal masking: no mask tensor, no padding,
-  and the quadratic part only over the real length.
+  and the quadratic part only over the real length. The rows are cut with `torch.split`, whose
+  backward is one concatenation; slicing them would have cost a zero-filled full-size gradient,
+  a copy and an add per row, about 800 tiny GPU launches per step.
 - **No copies for the shared heads.** Qwen has 12 query heads but only 2 key/value heads. Instead of
   copying k/v up to 12 heads (and keeping those copies around for the backward pass), we group the
   query heads as `[2, 6, L, D]` and broadcast each k/v head with a zero-copy view. If you ask SDPA for
@@ -106,7 +112,9 @@ forward matmul through a fused op that never calls `dequantize_4bit`, so we rout
   fp16 → fp32 → fp16 round trip before LoRA (`rmsnorm.py`).
 
 **6. Small fused kernels.** RMSNorm forward/backward, the residual add fused with the post-attention
-RMSNorm (`rmsnorm.py`), and rotary embeddings forward/backward (`rope.py`).
+RMSNorm (`rmsnorm.py`), and rotary embeddings forward/backward (`rope.py`). Under fp16 autocast the
+RoPE kernel writes fp16 directly (the value autocast would pass to the attention anyway), so the
+fp32→fp16 casts disappear and forward and backward share one compiled kernel.
 
 ### Our kernels
 
@@ -166,7 +174,7 @@ Speedup is against the base run of the same session.
 
 | Version | Time | Speedup | Peak memory | Memory ratio | Own-kernel share |
 |---|---|---|---|---|---|
-| Base Soup (average of 15 runs, 75.9–86.1 s) | 78.5 s | 1.00× | 14,345 MiB | 1.00× | |
+| Base Soup (median of 19 runs, 75.9–88.0 s) | 78.0 s | 1.00× | 14,345 MiB | 1.00× | |
 | Yerkhan's first solution: fused loss, NF4, RMSNorm, RoPE, fp16 SwiGLU | 78.3 s | 0.99× | 9,384 MiB | 1.53× | 11.8 % |
 | Shadiyar's solution: fused LM head + loss, fp16 norm path, NF4 (the starting point) | 66.6 s | 1.18× | 6,323 MiB | 2.27× | 6.3 % |
 | *from here on: Yerkhan*, + fp16 tied embedding | 69.2 s | 1.15× | 5,423 MiB | 2.65× | 5.9 % |
@@ -178,7 +186,13 @@ Speedup is against the base run of the same session.
 | + per-row attention | 55.8 s | 1.43× | 4,367 MiB | 3.29× | 13.2 % |
 | + zero-copy GQA, fewer compiles, smaller head chunks | 55.3 s | 1.37× | 4,013 MiB | 3.58× | 12.2 % |
 | + MLP recompute on dense batches | 55.5 s | 1.39× | 3,433 MiB | 4.18× | 12.6 % |
-| **Final code `68f44c2` (same as above + log lines), verification run** | **56.5 s** | **1.36×** | **3,433 MiB** | **4.18×** | **11.8 %** |
+| Code frozen at noon (`68f44c2`, same as above + log lines), verification run | 56.5 s | 1.36× | 3,433 MiB | 4.18× | 11.8 % |
+| + RoPE writes fp16, one compiled copy (`9ad9a45`) | 56.4 s | 1.56×† | 3,379 MiB | 4.25× | 11.6 % |
+| + per-row attention via `torch.split` (`8e63d40`) | 56.0 s | 1.36× | 3,399 MiB | 4.22× | 12.4 % |
+| **Final `8e63d40`: the public saved Kaggle run** | **56.4 s** | **1.54×†** | **3,399 MiB** | **4.22×** | **12.0 %** |
+
+† Against a slow base in that session (88.0 s and 86.8 s); against the median base (78.0 s) both are
+about 1.38×.
 
 Eval loss stayed within ±0.015 % of the base in every run (the limit is +0.5 %), and the loss curve
 within 0.05 % (limit 3 %).
@@ -186,14 +200,15 @@ within 0.05 % (limit 3 %).
 **Where the time goes now** (`runs/result.json` and the timeline in the log): the training loop
 takes 34.5 s against the base's 55.0 s (1.60×). Outside it, both runs spend about 22 s on Python and
 imports, Soup loading the tokenizer, data and 4-bit model, and saving. Inside our loop, the first two
-steps take about 6.5 s because Triton compiles our kernels on first use; after that a step takes
-about 0.45–0.5 s (the base's median step: 0.88 s).
+steps take about 6 s because Triton compiles our kernels on first use; after that a step takes about
+0.42 s (the base's median step: 0.88 s). A GPU profile shows the GPU busy about 280 ms of each step:
+the rest is the CPU issuing a few thousand small kernels, which is where further speed would come from.
 
 **Limitations, honestly:**
 
-- **Noise.** Each row is one run. Time varies about ±2 s between runs (the base alone ranged
-  76–86 s), and back-to-back runs on the same Kaggle GPU got slower over the morning, so speed
-  differences under ~5 % between rows don't mean much. Memory is stable to a few MiB.
+- **Noise.** Each row is one run. Time varies about ±2 s between runs, and the base alone ranged
+  76–88 s, which moves the speedup between about 1.36× and 1.56× for the same code. Speed differences
+  under ~5 % between rows don't mean much. Memory is stable to a few MiB.
 - **Fixed overhead caps the speedup.** About 20 s per run is loading that the base pays too, and
   compiling our kernels costs about 5–6 s that the base doesn't.
 - **Per-row attention relies on right padding** (what TRL's collator produces); other layouts use the
@@ -211,9 +226,9 @@ about 0.45–0.5 s (the base's median step: 0.88 s).
 | Name | Role | GitHub | Kaggle | Telegram |
 |---|---|---|---|---|
 | Yerkhan Serik (captain) | took the merged solution from 2.27× / 1.18× to 4.18× / 1.36×: padding removal, per-row and zero-copy attention, MLP recompute cap, NF4 unpack on both passes, RoPE, fp16 embedding, fixed the kernel-share margin; profiling, every verification run, README | [evilandangry](https://github.com/evilandangry) | [yerser](https://www.kaggle.com/yerser) | [@metalballadlover](https://t.me/metalballadlover) |
-| Shadiyar Musin | the starting point: fused LM head + loss, fp16 norm path, first NF4 kernel; later the fused add-norm; also the team name | — | — | — |
-| Madiyar Komilzhonov | presentation | — | — | — |
-| Mansur Utepbergen | team member | — | — | — |
+| Shadiyar Musin | the starting point: fused LM head + loss, fp16 norm path, first NF4 kernel; later the fused add-norm; also the team name | [shadiarmusin-eng](https://github.com/shadiarmusin-eng) | — | — |
+| Madiyar Komilzhonov | presentation | [forces57](https://github.com/forces57) | — | — |
+| Mansur Utepbergen | team member | [utepbergenovmansur68](https://github.com/utepbergenovmansur68) | — | — |
 
 ## Credits and sources
 
