@@ -90,6 +90,16 @@ class _PackedDropout(torch.autograd.Function):
         return (grad.float() * keep * ctx.scale).to(grad.dtype), None, None
 
 
+_ONES = [None, None]  # (key, tensor): the ones tensor of the current batch shape
+
+
+def _ones(shape, dtype, device):
+    key = (shape, dtype, device)
+    if _ONES[0] != key:
+        _ONES[0], _ONES[1] = key, torch.ones(shape, dtype=dtype, device=device)
+    return _ONES[1]
+
+
 def _wrap_dropout(mod):
     if getattr(mod, "_soup_unpad", False):
         return False
@@ -103,7 +113,8 @@ def _wrap_dropout(mod):
             return orig(x)
         B, T, H = c["B"], c["T"], x.shape[-1]
         # the same draw the base run makes: dropout on a [B, T, H] tensor of this dtype
-        ones = torch.ones((B, T, H), dtype=x.dtype, device=x.device)
+        # (the ones tensor is made once per batch shape and reused by all 56 dropout calls)
+        ones = _ones((B, T, H), x.dtype, x.device)
         keep = F.dropout(ones, p, True) != 0
         keep = keep.view(B * T, H).index_select(0, c["idx"]).view(x.shape)
         return _PackedDropout.apply(x, keep, 1.0 / (1.0 - p))
@@ -199,15 +210,12 @@ def _per_row_attention(module, query, key, value, lens, kwargs):
     groups = getattr(module, "num_key_value_groups", 1)
     scale = kwargs.get("scaling")
     dropout = kwargs.get("dropout", 0.0) or 0.0
-    outs, start = [], 0
-    for length in lens:
-        if length == 0:
-            continue
-        end = start + length
-        out = _row_attention(query[:, :, start:end], key[:, :, start:end],
-                             value[:, :, start:end], groups, length > 1, scale, dropout)
-        outs.append(out.transpose(1, 2))  # [1, length, heads, D]
-        start = end
+    # torch.split, not slicing: in the backward pass a split is one concatenation per tensor,
+    # while every slice would allocate a full-size zero gradient, copy into it and add them up
+    sizes = [length for length in lens if length > 0]
+    rows = zip(query.split(sizes, dim=2), key.split(sizes, dim=2), value.split(sizes, dim=2))
+    outs = [_row_attention(q, k, v, groups, q.shape[2] > 1, scale, dropout).transpose(1, 2)
+            for q, k, v in rows]  # each [1, length, heads, D]
     return torch.cat(outs, dim=1).contiguous()
 
 
