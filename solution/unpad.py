@@ -14,8 +14,8 @@ How (the math for real tokens is unchanged; only where the data sits changes):
   q, k and v are scattered back to [B, heads, T, D], the same masked attention runs, and the real
   rows are gathered out again.
 - LoRA dropout: the random mask is drawn on a padded tensor of the same shape and dtype the base
-  run draws it on, so the random numbers are the same as the base, then packed. A small Triton
-  kernel applies it (forward and backward).
+  run draws it on, so the random numbers are the same as the base, then packed, and applied to
+  the packed tokens (fp32 math, one rounding, exactly like PyTorch's dropout).
 Anything unusual (no padding, eval, caches, sliding windows, extra outputs requested) runs the
 original code.
 """
@@ -23,8 +23,6 @@ import threading
 
 import torch
 import torch.nn.functional as F
-import triton
-import triton.language as tl
 
 _STATE = threading.local()
 _SAID = set()
@@ -41,36 +39,21 @@ def _ctx():
     return getattr(_STATE, "ctx", None)
 
 
-# ------------------------------------------------------------------ dropout kernel
-@triton.jit
-def _mask_scale_kernel(X, M, Y, n, scale, BLOCK: tl.constexpr):
-    offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
-    m = offs < n
-    x = tl.load(X + offs, mask=m, other=0.0).to(tl.float32)
-    k = tl.load(M + offs, mask=m, other=0).to(tl.float32)
-    tl.store(Y + offs, (x * k * scale).to(Y.dtype.element_ty), mask=m)
-
-
-def _mask_scale(x, keep_u8, scale):
-    y = torch.empty_like(x)
-    n = x.numel()
-    _mask_scale_kernel[(triton.cdiv(n, 4096),)](x, keep_u8, y, n, scale, BLOCK=4096, num_warps=8)
-    return y
-
-
+# ------------------------------------------------------------------ dropout
 class _PackedDropout(torch.autograd.Function):
-    """y = x * keep / (1 - p), computed in fp32 and rounded once, like PyTorch's dropout kernel."""
+    """y = x * keep / (1 - p), computed in fp32 and rounded once, like PyTorch's dropout kernel.
+    Saves only the boolean mask for the backward pass, as PyTorch's dropout does."""
 
     @staticmethod
-    def forward(ctx, x, keep_u8, scale):
-        ctx.save_for_backward(keep_u8)
+    def forward(ctx, x, keep, scale):
+        ctx.save_for_backward(keep)
         ctx.scale = scale
-        return _mask_scale(x, keep_u8, scale)
+        return (x.float() * keep * scale).to(x.dtype)
 
     @staticmethod
     def backward(ctx, grad):
-        (keep_u8,) = ctx.saved_tensors
-        return _mask_scale(grad.contiguous(), keep_u8, ctx.scale), None, None
+        (keep,) = ctx.saved_tensors
+        return (grad.float() * keep * ctx.scale).to(grad.dtype), None, None
 
 
 def _wrap_dropout(mod):
@@ -89,7 +72,7 @@ def _wrap_dropout(mod):
         ones = torch.ones((B, T, H), dtype=x.dtype, device=x.device)
         keep = F.dropout(ones, p, True) != 0
         keep = keep.view(B * T, H).index_select(0, c["idx"]).view(x.shape)
-        return _PackedDropout.apply(x.contiguous(), keep.view(torch.uint8), 1.0 / (1.0 - p))
+        return _PackedDropout.apply(x, keep, 1.0 / (1.0 - p))
 
     mod.forward = forward
     mod._soup_unpad = True
@@ -202,7 +185,9 @@ def patch_unpad():
         if mask is None:
             return original()
         rope = self.rotary_emb(embeds, pos)
-        _say(f"active (first batch: {n} real tokens of {B * T} slots)")
+        if "active" not in _SAID:
+            _SAID.add("active")
+            print(f"[solution] unpad: active (first batch: {n} real tokens of {B * T} slots)")
         kwargs.pop("return_dict", None)
         _STATE.ctx = {"B": B, "T": T, "idx": idx, "n": n}
         try:

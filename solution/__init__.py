@@ -44,5 +44,3 @@ def apply():
     except Exception as e:  # noqa: BLE001
         print(f"[solution] SKIPPED patch_embed_fp16: {e}")
 
-    from . import debug_saved  # DEBUG ONLY: does nothing unless the flag file exists
-    debug_saved.patch()
